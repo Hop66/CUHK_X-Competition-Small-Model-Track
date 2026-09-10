@@ -252,6 +252,9 @@ class MotionBertSkeletonDataset(Dataset):
         return feat
 
     def __getitem__(self, i: int):
+        if self.is_train:
+            # worker 种源+样本序号重派生（只按 initial_seed → 同 worker 增广参数全同）
+            self.rng = np.random.default_rng(int((torch.initial_seed() + i) & 0x7FFFFFFF))
         clip = self.clips[i]
         kp, conf = self._load_frames(clip.pred_dir)  # [N,17,3], [N,17]
         if kp.shape[0] == 0:

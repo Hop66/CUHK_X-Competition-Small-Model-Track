@@ -43,6 +43,13 @@ def main():
                     choices=["framenet", "resnet18", "resnet34"],
                     help="framenet=从零小 CNN（已验证 0.21 判负）；resnet18/34=ImageNet 预训练 2D"
                          "+ per-frame logits mean（0.8 组方法强化版）")
+    ap.add_argument("--no_balanced", action="store_true",
+                    help="关类平衡采样（严格复刻 14th：无重采样，纯随机）")
+    ap.add_argument("--aug_strength", type=int, default=2,
+                    help="训练增强档位 0-3（14th 精髓=仅翻转 → 用 --flip_only）")
+    ap.add_argument("--flip_only", action="store_true",
+                    help="严格 14th 增广：仅水平翻转 p=0.5，无亮度/对比度/缩放"
+                         "（aug_strength=0 连翻转都没有，=1 带亮度对比度，均非精确复刻）")
     ap.add_argument("--sample_mode", type=str, default="segment", choices=["uniform", "segment"])
     ap.add_argument("--gray_norm", action="store_true")
     ap.add_argument("--imagenet_norm", action="store_true",
@@ -79,12 +86,16 @@ def main():
         ms = None
     track_kw = dict(track_crop=args.track_crop, box_path=args.box_path) if args.track_crop else {}
     train_ds = ThermalVideoDataset(tr_clips, args.num_frames, args.size, True, crop_cache,
-                                   aug_strength=2, sample_mode=args.sample_mode, mean_std=ms,
-                                   **track_kw)
+                                   aug_strength=args.aug_strength, sample_mode=args.sample_mode,
+                                   mean_std=ms, **track_kw)
+    if args.flip_only:
+        train_ds.aug_flip, train_ds.aug_bright, train_ds.aug_contrast = 0.5, (1.0, 1.0), (1.0, 1.0)
+        train_ds.aug_scale, train_ds.aug_shift = (1.0, 1.0), 0.0
     val_ds = ThermalVideoDataset(va_clips, args.num_frames, args.size, False, crop_cache,
                                  sample_mode=args.sample_mode, mean_std=ms, **track_kw)
-    sampler = build_balanced_sampler([c.action_id for c in tr_clips])
-    tr_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
+    _sampler = None if args.no_balanced else build_balanced_sampler([c.action_id for c in tr_clips])
+    tr_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=_sampler,
+                           shuffle=args.no_balanced,
                            num_workers=args.workers, pin_memory=True, drop_last=True)
     va_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                            num_workers=args.workers, pin_memory=True)
@@ -108,7 +119,7 @@ def main():
                 x = it[0].to(device)
                 tr = it[1].to(device) if args.track_crop else None
                 y = it[2 if args.track_crop else 1].to(device)
-                out = model(x, tr)
+                out = model(x, tr) if tr is not None else model(x)
                 correct += (out.argmax(-1) == y).sum().item()
                 total += y.numel()
         return correct / max(total, 1)
@@ -126,7 +137,7 @@ def main():
             tr = it[1].to(device) if args.track_crop else None
             y = it[2 if args.track_crop else 1].to(device)
             opt.zero_grad()
-            loss = crit(model(x, tr), y)
+            loss = crit(model(x, tr) if tr is not None else model(x), y)
             loss.backward()
             opt.step()
             run_loss += loss.item() * y.numel()

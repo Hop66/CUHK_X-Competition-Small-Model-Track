@@ -85,28 +85,40 @@ class ClipIndex:
         self.ir_dir = ir_dir
 
 
-def build_train_index(train_root: Path, use_dirs=(("depth", "Depth_Color"), ("ir", "IR"))) -> List[ClipIndex]:
-    """遍历训练集，产出 clip 索引。discovery 用 Depth_Color（3.6% 缺失时用 IR 兜底）。"""
+def build_train_index(train_root: Path, use_dirs=(("depth", "Depth_Color"), ("ir", "IR")),
+                      include_ir_only: bool = False) -> List[ClipIndex]:
+    """遍历训练集，产出 clip 索引（main：Depth+IR）。默认 discovery 只用 Depth_Color 树（保持 2931 基线）；
+    include_ir_only=True 时补扫 IR 树并集去重（修复仅 IR、无 Depth_Color 的 ~105 clip 被静默丢弃）。"""
     clips: List[ClipIndex] = []
-    discovery = Path(train_root) / "Depth_Color"
-    if not discovery.is_dir():
-        discovery = Path(train_root) / "Thermal"
-    for action_dir in sorted(discovery.iterdir()):
-        if not action_dir.is_dir():
-            continue
-        try:
-            action_id = int(action_dir.name.split("_")[0])
-        except ValueError:
-            continue
-        for subj_dir in sorted(action_dir.iterdir()):
-            if not subj_dir.is_dir():
+    t_root = Path(train_root)
+    disc = t_root / "Depth_Color"
+    if not disc.is_dir():
+        disc = t_root / "Thermal"
+    trees = [disc]
+    if include_ir_only and (t_root / "IR").is_dir() and disc != (t_root / "IR"):
+        trees.append(t_root / "IR")
+    seen = set()
+    for tree in trees:
+        for action_dir in sorted(tree.iterdir()):
+            if not action_dir.is_dir():
                 continue
-            for sample_dir in sorted(subj_dir.iterdir()):
-                if not sample_dir.is_dir():
+            try:
+                action_id = int(action_dir.name.split("_")[0])
+            except ValueError:
+                continue
+            for subj_dir in sorted(action_dir.iterdir()):
+                if not subj_dir.is_dir():
                     continue
-                depth_dir = Path(train_root) / "Depth_Color" / action_dir.name / subj_dir.name / sample_dir.name
-                ir_dir = Path(train_root) / "IR" / action_dir.name / subj_dir.name / sample_dir.name
-                clips.append(ClipIndex(action_id, subj_dir.name, sample_dir.name, depth_dir, ir_dir))
+                for sample_dir in sorted(subj_dir.iterdir()):
+                    if not sample_dir.is_dir():
+                        continue
+                    key = (action_id, subj_dir.name, sample_dir.name)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    depth_dir = t_root / "Depth_Color" / action_dir.name / subj_dir.name / sample_dir.name
+                    ir_dir = t_root / "IR" / action_dir.name / subj_dir.name / sample_dir.name
+                    clips.append(ClipIndex(action_id, subj_dir.name, sample_dir.name, depth_dir, ir_dir))
     return clips
 
 
@@ -118,6 +130,60 @@ def build_test_index(test_root: Path) -> List[Tuple[str, Path, Path]]:
         if d.is_dir() and d.name.startswith("SM_test_"):
             out.append((d.name, d / "Depth_Color", d / "IR"))
     return out
+
+
+def _skeleton_heatmap(pred_dir, T: int = 16, S: int = 128, sigma: float = 3.0, box=None):
+    """M1(3D 保留版): 骨架 3D 三正交视图 heatmap stack [T,3,S,S].
+    正=[x,z], 侧=[y,z], 俯=[x,y] -- 每 view 独立 minmax 归一化到 box(与 main bbox 窗对齐)。"""
+    import json as _json
+    fs = sorted(Path(pred_dir).glob("*.json"), key=lambda f: frame_num_of(f.name) or 0)
+    if len(fs) < 2:
+        return None
+    idx = np.linspace(0, len(fs) - 1, T).round().astype(int)
+    hm = np.zeros((T, 3, S, S), np.float32)
+    yy, xx = np.mgrid[0:S, 0:S]
+    var = float(sigma * sigma)
+    if box is None:
+        bx0, by0, bx1, by1 = 0.15, 0.05, 0.85, 0.95
+    else:
+        bx0, by0, bx1, by1 = [float(v) for v in box]
+    ox, oy, w, h = bx0 * S, by0 * S, (bx1 - bx0) * S, (by1 - by0) * S
+    views = ((0, 2), (1, 2), (0, 1))   # 正面/侧面/俯视
+    for t, fi in enumerate(idx):
+        try:
+            o = _json.loads(fs[fi].read_text("utf-8"))
+            fr = o if isinstance(o, dict) else o[0]
+            kp = np.asarray(fr["keypoints"], np.float32).reshape(17, 3)
+        except Exception:
+            continue
+        for v, (ai, bi) in enumerate(views):
+            a, b = kp[:, ai], kp[:, bi]
+            am, aM, bm, bM = a.min(), a.max(), b.min(), b.max()
+            rw = (a - am) / max(aM - am, 1e-3)
+            if ai == 0:            # 世界 x 与图像 x 反方向 → 镜像
+                rw = 1.0 - rw
+            px = ox + rw * w
+            py = oy + (1.0 - (b - bm) / max(bM - bm, 1e-3)) * h
+            for j in range(17):
+                if 0 <= px[j] < S and 0 <= py[j] < S:
+                    hm[t, v] += np.exp(-((xx - px[j]) ** 2 + (yy - py[j]) ** 2) / (2 * var))
+    return np.clip(hm, 0, 1).astype(np.float32)
+
+
+def _random_erase_t(x: torch.Tensor, p: float, rng: np.random.Generator) -> None:
+    """时序一致随机擦除（原地）：以概率 p 在 x[T,C,H,W] 选单个矩形区域置中间灰，跨帧一致。
+    仿真实体/传感器遮挡的跨被试域偏移。x 须在 [0,1] 且未归一化。
+    """
+    if rng.random() >= p or x.numel() == 0:
+        return
+    T, C, H, W = x.shape
+    rh = int(H * float(rng.uniform(0.06, 0.30)))
+    rw = int(W * float(rng.uniform(0.06, 0.30)))
+    rh = max(rh, 1)
+    rw = max(rw, 1)
+    y0 = int(rng.integers(0, max(H - rh, 1)))
+    x0 = int(rng.integers(0, max(W - rw, 1)))
+    x[:, :, y0:y0 + rh, x0:x0 + rw] = 0.5
 
 
 class DepthIRVideoDataset(Dataset):
@@ -141,17 +207,21 @@ class DepthIRVideoDataset(Dataset):
         track_crop: bool = False,
         box_path: str = "",
         person_margin: float = 1.1,
+        return_key: bool = False,
+        skel_map: Optional[dict] = None,
     ):
         self.clips = clips
         self.num_frames = num_frames
         self.size = size
         self.is_train = is_train
         self.crop_cache = crop_cache or {}
+        self.skel_map = skel_map or {}   # {action_id/subject/sample: pred_dir} → 拼骨架 heatmap 通道(M1)
         self.use_ir_mask = use_ir_mask
         self.use_frame_diff = use_frame_diff
         self.sample_offset = sample_offset  # 时间 TTA：-1=endpoint uniform；0~1=窗口起点偏移
         self.sample_mode = sample_mode      # uniform | segment（全球覆盖分段采样，14th-place 移植）
         self.track_crop = track_crop        # main 3D 主战场：逐帧跟人裁剪 + 轨迹通道
+        self.return_key = return_key        # 蒸馏/教师对齐用：__getitem__ 追加 clip key
         self.person_margin = person_margin
         self._pf_frame = {}
         if track_crop and box_path:
@@ -171,8 +241,11 @@ class DepthIRVideoDataset(Dataset):
         # 亮度/对比度校正（测试侧亮度捷径验证用；默认 1.0/0.0 不改变行为）
         self.brightness_alpha = brightness_alpha
         self.brightness_beta = brightness_beta
-        # 训练增强强度档位（0=无 1=温和 2=当前强 3=更强），供组合搜索
+        # 训练增强强度档位（0=无 1=温和 2=当前强 3=更强 4=域鲁棒），供组合搜索
         self.aug_strength = aug_strength
+        self.aug_perchannel = False   # 4 档：逐通道独立亮度抖动（Depth 伪彩/IR 各自）
+        self.aug_erase = 0.0          # 4 档：时序一致随机擦除概率（实体遮挡）
+        self.aug_speed = 0.0          # 4 档：时间速度抖动概率（跨被试动作速度域偏移）
         if aug_strength == 0:
             self.aug_flip, self.aug_bright, self.aug_contrast = 0.0, (1.0, 1.0), (1.0, 1.0)
             self.aug_scale, self.aug_shift = (1.0, 1.0), 0.0
@@ -182,6 +255,12 @@ class DepthIRVideoDataset(Dataset):
         elif aug_strength == 3:
             self.aug_flip, self.aug_bright, self.aug_contrast = 0.5, (0.75, 1.25), (0.75, 1.25)
             self.aug_scale, self.aug_shift = (0.8, 1.2), 0.10
+        elif aug_strength == 4:  # 域鲁棒配方：擦除+逐通道扰动+时间速度抖动+更大尺度
+            self.aug_flip, self.aug_bright, self.aug_contrast = 0.5, (1.0, 1.0), (1.0, 1.0)
+            self.aug_scale, self.aug_shift = (0.75, 1.3), 0.14
+            self.aug_perchannel = True
+            self.aug_erase = 0.3
+            self.aug_speed = 0.3
         else:  # 2 = 当前强（默认）
             self.aug_flip, self.aug_bright, self.aug_contrast = 0.5, (0.8, 1.2), (0.8, 1.2)
             self.aug_scale, self.aug_shift = (0.85, 1.15), 0.08
@@ -196,7 +275,20 @@ class DepthIRVideoDataset(Dataset):
         else:
             self.mean = torch.tensor((*mean3, sum(mean3) / 3.0)).view(1, 4, 1, 1)
             self.std = torch.tensor((*std3, sum(std3) / 3.0)).view(1, 4, 1, 1)
-
+    def _append_skel_heat(self, x: torch.Tensor, clip, do_flip: bool, box=None):
+        """M1: 骨架 heatmap 通道并入 x(pixel-aligned 于 bbox 窗; 拼在归一化后)。
+        无骨架的 clip 也补 3ch 零 → batch 恒 7ch(避免 collate 通道不一致)。"""
+        key = f"{clip.action_id}/{clip.subject}/{clip.sample}"
+        pd2 = self.skel_map.get(key)
+        T, _, S, _ = x.shape
+        if pd2 is None:
+            hm = torch.zeros(T, 3, S, S)
+        else:
+            hm_np = _skeleton_heatmap(pd2, T=T, S=S, box=box)
+            hm = torch.from_numpy(hm_np) if hm_np is not None else torch.zeros(T, 3, S, S)
+        if do_flip:
+            hm = torch.flip(hm, dims=(3,))
+        return torch.cat([x, hm.to(x.dtype)], dim=1)
     def __len__(self):
         return len(self.clips)
 
@@ -218,6 +310,10 @@ class DepthIRVideoDataset(Dataset):
         return np.linspace(0, n - 1, self.num_frames).round().astype(int)
 
     def __getitem__(self, i: int):
+        if self.is_train:
+            # 修复：DataLoader fork 复制同一 self.rng → 各 worker 同序列；用 worker 种源+样本序号重派生
+            #（只按 initial_seed 会让同一 worker 内所有样本增广参数相同）
+            self.rng = np.random.default_rng(int((torch.initial_seed() + i) & 0x7FFFFFFF))
         clip = self.clips[i]
         depth_map = list_images(clip.depth_dir)
         ir_map = list_images(clip.ir_dir)
@@ -226,6 +322,14 @@ class DepthIRVideoDataset(Dataset):
         if not common:
             common = sorted(depth_map.keys()) or sorted(ir_map.keys())
         idx = self._uniform_indices(len(common))
+        # 4 档：时间速度抖动（跨被试速度域偏移仿真：非线性重映射帧索引 → 快/慢动作）
+        if self.is_train and self.aug_speed > 0 and len(common) > 4 and self.rng.random() < self.aug_speed:
+            _n = len(common)
+            stride = float(self.rng.uniform(0.8, 1.25))
+            pos = np.arange(len(idx)) * stride
+            if pos[-1] > 1e-6:
+                pos = pos * (_n - 1) / pos[-1]
+            idx = np.round(np.clip(pos, 0, _n - 1)).astype(int)
         picked = [common[j] for j in idx]
 
         crop = self.crop_cache.get(self._clip_key(clip), None)
@@ -287,9 +391,14 @@ class DepthIRVideoDataset(Dataset):
         x = torch.from_numpy(frames)
         # 训练增强：亮度/对比度（只动 brightness/contrast，保护 Depth 伪彩色几何语义）
         if self.is_train:
-            x = x * bright
-            x = (x - 0.5) * contrast + 0.5
-            x = torch.clamp(x, 0.0, 1.0)
+            if self.aug_perchannel:
+                gains = torch.tensor(self.rng.uniform(0.88, 1.12, size=x.shape[1]),
+                                     dtype=x.dtype).view(1, -1, 1, 1)
+                x = torch.clamp(x * gains, 0.0, 1.0)
+            else:
+                x = x * bright
+                x = (x - 0.5) * contrast + 0.5
+                x = torch.clamp(x, 0.0, 1.0)
         if self.use_frame_diff:
             diff = torch.zeros_like(x)
             diff[1:] = (x[1:] - x[:-1]).abs()
@@ -297,11 +406,18 @@ class DepthIRVideoDataset(Dataset):
         if do_flip:
             x = torch.flip(x, dims=(3,))  # 水平翻转（对 4/8ch 一致）
             traj[:, 0] = 1.0 - traj[:, 0]
+        if self.is_train and self.aug_erase > 0:
+            _random_erase_t(x, self.aug_erase, self.rng)
         x = (x - self.mean) / self.std
+        if self.skel_map:
+            x = self._append_skel_heat(x, clip, do_flip, crop)
         label = clip.action_id
+        out = (x, label, clip.subject)
         if self.track_crop:
-            return x, torch.from_numpy(traj), label, clip.subject
-        return x, label, clip.subject
+            out = (x, torch.from_numpy(traj), label, clip.subject)
+        if self.return_key:
+            out = out + (f"{clip.action_id}/{clip.subject}/{clip.sample}",)
+        return out
 
     def _load(self, path: Optional[Path], channels: int,
               crop: Optional[Tuple[float, float, float, float]] = None) -> Optional[np.ndarray]:
@@ -392,13 +508,15 @@ class ThermalVideoDataset(Dataset):
                  mean_std: Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float]]] = None,
                  track_crop: bool = False,
                  box_path: str = "",
-                 person_margin: float = 1.1):
+                 person_margin: float = 1.1,
+                 return_key: bool = False):
         self.clips = clips
         self.num_frames = num_frames
         self.size = size
         self.is_train = is_train
         self.crop_cache = crop_cache or {}
         self.use_frame_diff = use_frame_diff
+        self.return_key = return_key
         self.sample_offset = sample_offset  # 时间 TTA：-1=endpoint uniform；0~1=窗口起点偏移
         self.sample_mode = sample_mode      # uniform | segment（全球覆盖分段采样）
         self.mean_std = mean_std            # 自定义归一化（如 ImageNet / 灰度拉伸），None=默认 Kinetics
@@ -418,6 +536,9 @@ class ThermalVideoDataset(Dataset):
         self.rng = np.random.default_rng(seed)
         # 训练增强强度档位（与 DepthIR 一致：0=无 1=温和 2=强 3=更强）
         self.aug_strength = aug_strength
+        self.aug_perchannel = False
+        self.aug_erase = 0.0
+        self.aug_speed = 0.0
         if aug_strength == 0:
             self.aug_flip, self.aug_bright, self.aug_contrast = 0.0, (1.0, 1.0), (1.0, 1.0)
             self.aug_scale, self.aug_shift = (1.0, 1.0), 0.0
@@ -427,6 +548,12 @@ class ThermalVideoDataset(Dataset):
         elif aug_strength == 3:
             self.aug_flip, self.aug_bright, self.aug_contrast = 0.5, (0.75, 1.25), (0.75, 1.25)
             self.aug_scale, self.aug_shift = (0.8, 1.2), 0.10
+        elif aug_strength == 4:
+            self.aug_flip, self.aug_bright, self.aug_contrast = 0.5, (1.0, 1.0), (1.0, 1.0)
+            self.aug_scale, self.aug_shift = (0.75, 1.3), 0.14
+            self.aug_perchannel = True
+            self.aug_erase = 0.3
+            self.aug_speed = 0.3
         else:  # 2 = 当前强（默认）
             self.aug_flip, self.aug_bright, self.aug_contrast = 0.5, (0.8, 1.2), (0.8, 1.2)
             self.aug_scale, self.aug_shift = (0.85, 1.15), 0.08
@@ -461,12 +588,23 @@ class ThermalVideoDataset(Dataset):
         return np.linspace(0, n - 1, self.num_frames).round().astype(int)
 
     def __getitem__(self, i: int):
+        if self.is_train:
+            # 同 DepthIR：worker 种源+样本序号重派生（只按 initial_seed → 同 worker 增广参数全同）
+            self.rng = np.random.default_rng(int((torch.initial_seed() + i) & 0x7FFFFFFF))
         clip = self.clips[i]
         files = sorted(clip.thermal_dir.glob("*.jpg")) + sorted(clip.thermal_dir.glob("*.png"))
         if not files:
+            self._last_do_flip = False
             return torch.zeros(self.num_frames, 3, self.size, self.size), clip.action_id, clip.subject
         n = len(files)
         idx = self._sample_indices(n)
+        # 4 档：时间速度抖动（跨被试速度域偏移仿真，与 DepthIR 流同协议）
+        if self.is_train and self.aug_speed > 0 and n > 4 and self.rng.random() < self.aug_speed:
+            stride = float(self.rng.uniform(0.8, 1.25))
+            pos = np.arange(len(idx)) * stride
+            if pos[-1] > 1e-6:
+                pos = pos * (n - 1) / pos[-1]
+            idx = np.round(np.clip(pos, 0, n - 1)).astype(int)
         crop = self.crop_cache.get(f"{clip.action_id}/{clip.subject}/{clip.sample}")
         # 训练增强参数（per-clip 一致）：翻转 + 亮度/对比度 + 缩放/平移（按 aug_strength）
         do_flip = False
@@ -485,6 +623,7 @@ class ThermalVideoDataset(Dataset):
                 nw, nh = w * s, h * s
                 crop = (max(cx - nw / 2.0 + dx * w, 0.0), max(cy - nh / 2.0 + dy * h, 0.0),
                         min(cx + nw / 2.0 + dx * w, 1.0), min(cy + nh / 2.0 + dy * h, 1.0))
+        self._last_do_flip = do_flip  # 子类（video+骨架等）据此同步镜像非图像目标
         frames = np.zeros((self.num_frames, 3, self.size, self.size), np.float32)
         # 逐帧跟人裁剪（人物满框 + 背景≈0）：pf_map 每帧 box；缺失帧回退 clip 单框
         traj = np.zeros((self.num_frames, 4), np.float32)   # [cx, cy, bw, bh] 相对画面（位移/尺度显式通道）
@@ -523,9 +662,14 @@ class ThermalVideoDataset(Dataset):
             frames[t] = img.transpose(2, 0, 1) / 255.0
         x = torch.from_numpy(frames)
         if self.is_train:
-            x = x * bright
-            x = (x - 0.5) * contrast + 0.5
-            x = torch.clamp(x, 0.0, 1.0)
+            if self.aug_perchannel:
+                gains = torch.tensor(self.rng.uniform(0.88, 1.12, size=x.shape[1]),
+                                     dtype=x.dtype).view(1, -1, 1, 1)
+                x = torch.clamp(x * gains, 0.0, 1.0)
+            else:
+                x = x * bright
+                x = (x - 0.5) * contrast + 0.5
+                x = torch.clamp(x, 0.0, 1.0)
         if self.use_frame_diff:
             diff = torch.zeros_like(x)
             diff[1:] = (x[1:] - x[:-1]).abs()
@@ -533,10 +677,15 @@ class ThermalVideoDataset(Dataset):
         if do_flip:
             x = torch.flip(x, dims=(3,))
             traj[:, 0] = 1.0 - traj[:, 0]   # 水平翻转后人物 x 中心镜像
+        if self.is_train and self.aug_erase > 0:
+            _random_erase_t(x, self.aug_erase, self.rng)
         x = (x - self.mean) / self.std
         if self.track_crop:
             return x, torch.from_numpy(traj), clip.action_id, clip.subject
-        return x, clip.action_id, clip.subject
+        out = (x, clip.action_id, clip.subject)
+        if self.return_key:
+            out = out + (f"{clip.action_id}/{clip.subject}/{clip.sample}",)
+        return out
 
 
 def build_balanced_sampler(labels: List[int], num_samples: Optional[int] = None):

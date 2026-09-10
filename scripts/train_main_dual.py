@@ -65,6 +65,9 @@ def main():
     ap.add_argument("--motion_cache", default="outputs/motion_cache.pkl")
     ap.add_argument("--weights", default="ig65m_r2plus1d34.pth")
     ap.add_argument("--no_motion", action="store_true")
+    ap.add_argument("--full", action="store_true",
+                    help="全量模式：全部 clips 训练、无 val，按 full_save_every 存快照（多 seed 集成）")
+    ap.add_argument("--full_save_every", type=int, default=10, help="全量模式快照保存间隔")
     ap.add_argument("--label_smoothing", type=float, default=0.1)
     ap.add_argument("--save_dir", default="outputs/main_dual")
     ap.add_argument("--seed", type=int, default=7)
@@ -76,9 +79,13 @@ def main():
 
     root = Path(args.train_root).expanduser()
     clips = build_train_index(root)                      # main 2931
-    folds = split_by_subject(clips, n_folds=args.folds)
-    tr_idx, va_idx = folds[args.fold]
-    tr_c, va_c = [clips[i] for i in tr_idx], [clips[i] for i in va_idx]
+    if args.full:
+        tr_c, va_c, split_tag = clips, [], "full"
+    else:
+        folds = split_by_subject(clips, n_folds=args.folds)
+        tr_idx, va_idx = folds[args.fold]
+        tr_c, va_c = [clips[i] for i in tr_idx], [clips[i] for i in va_idx]
+        split_tag = f"fold{args.fold}"
 
     crop_cache = {}
     if args.crop_cache and Path(args.crop_cache).expanduser().exists():
@@ -136,8 +143,11 @@ def main():
 
     save_dir = Path(args.save_dir).expanduser()
     save_dir.mkdir(parents=True, exist_ok=True)
-    save_path = save_dir / f"main_{'SM' if not args.no_motion else 'S'}_fold{args.fold}.pth"
-    best, no_impr = 0.0, 0
+    if args.full:
+        save_path = save_dir / f"main_{'SM' if not args.no_motion else 'S'}_full_seed{args.seed}.pth"
+    else:
+        save_path = save_dir / f"main_{'SM' if not args.no_motion else 'S'}_fold{args.fold}.pth"
+    best, no_impr, saved_at = 0.0, 0, 0
     for ep in range(args.epochs):
         model.train()
         run_loss = n = 0
@@ -150,19 +160,33 @@ def main():
             run_loss += loss.item() * y.numel()
             n += y.numel()
         sched.step()
-        acc = evaluate()
-        if acc > best:
-            best, no_impr = acc, 0
-            torch.save({"model": model.state_dict(), "best_acc": best}, save_path)
+        msg = "[full] " if args.full else f"[fold{args.fold}] "
+        if args.full:
+            # 全量：无 val → 按 full_save_every 存快照（多 seed 集成），跑满 epochs
+            if (ep + 1) % args.full_save_every == 0:
+                torch.save({"model": model.state_dict(), "epoch": ep + 1, "best_acc": 0.0}, save_path)
+                saved_at = ep + 1
+            print(f"{msg}ep{ep + 1}/{args.epochs} loss={run_loss / max(n, 1):.4f} (last_saved@{saved_at})",
+                  flush=True)
         else:
-            no_impr += 1
-        print(f"[fold{args.fold}] ep{ep + 1}/{args.epochs} loss={run_loss / max(n, 1):.4f} "
-              f"val={acc:.4f} best={best:.4f}", flush=True)
-        if no_impr >= 15:
-            print(f"[fold{args.fold}] early stop @ ep{ep + 1}", flush=True)
-            break
-    print(f"== MainDual[{tag}] fold{args.fold} best = {best:.4f} "
-          f"（对照 main 固定框基线 0.6609）→ {save_path}", flush=True)
+            acc = evaluate()
+            if acc > best:
+                best, no_impr = acc, 0
+                torch.save({"model": model.state_dict(), "best_acc": best}, save_path)
+            else:
+                no_impr += 1
+            print(f"{msg}ep{ep + 1}/{args.epochs} loss={run_loss / max(n, 1):.4f} "
+                  f"val={acc:.4f} best={best:.4f}", flush=True)
+            if no_impr >= 15:
+                print(f"{msg}early stop @ ep{ep + 1}", flush=True)
+                break
+    if args.full:
+        if saved_at == 0:
+            torch.save({"model": model.state_dict(), "epoch": args.epochs, "best_acc": 0.0}, save_path)
+        print(f"== MainDual[{tag}] full seed{args.seed} DONE -> {save_path}（末快照）", flush=True)
+    else:
+        print(f"== MainDual[{tag}] fold{args.fold} best = {best:.4f} "
+              f"（对照 main 固定框基线 0.6609 → 骨架 dual 三折 mean+2.9pt）→ {save_path}", flush=True)
 
 
 if __name__ == "__main__":

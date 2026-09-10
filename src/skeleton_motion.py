@@ -84,13 +84,25 @@ def resample_to_T(arr: np.ndarray, T: int) -> np.ndarray:
     return out.reshape((T,) + arr.shape[1:]).astype(np.float32)
 
 
-def extract_motion_features(kp: np.ndarray, T: Optional[int] = None) -> np.ndarray:
+def extract_motion_features(kp: np.ndarray, T: Optional[int] = None,
+                            speed_scale: float = 1.0,
+                            resample: Optional[int] = None) -> np.ndarray:
     """kp[N,17,3]（米制 , 轴序[x左右, y前后=深度, z高度]）→ 运动特征 [T, K_DIM]。
 
     - 先提取每帧特征（N 行 K_DIM），再按 T 比例重采样（T 省略则返回 [N, K_DIM]）。
     - 全部除以躯干长（0-8 平均距离），量纲无关、跨被试体型归一。
+    - speed_scale：对时间差分类 dim（速度/角速度）的幅值缩放。**测试骨架与训练骨架
+      采样密度/fps 可能不同（实测测试每帧速度幅值≈训练×2.09，但帧数相近，说明测试
+      每帧跨越的真实时间更长，即测试实际更「稀」或含关节噪声）** → 速度特征(/帧)跨域
+      → MotionNet OOD。推理时传 训练fps/测试fps 以对齐训练域；训练/val 提取传 1.0。
+    - resample（int）：**真·重采样** —— 在特征提取前先把原始 kp [N,17,3] 线性重采样
+      到 M=resample 帧（kp 级，非特征级）。作用：改变每帧跨越的真实时间 → 重算出的
+      速度特征才真正对齐目标 cadence（speed_scale 只是提取后标量缩放，不改变时序）。
+      传入 M 大于 N 为升采样（每帧物理时间变短→每帧速度变小）；小于 N 为降采样。
     """
     kp = kp.astype(np.float32)
+    if resample is not None and kp.shape[0] > 0:
+        kp = resample_to_T(kp, int(resample))
     n = kp.shape[0]
     if n == 0:
         return np.zeros((T or 0, K_DIM), np.float32)
@@ -149,6 +161,12 @@ def extract_motion_features(kp: np.ndarray, T: Optional[int] = None) -> np.ndarr
     # 27-28 伸手范围（腕-骨盆 距离）
     feat[:, 27] = np.linalg.norm(body[:, J_WRIST_L], axis=1)
     feat[:, 28] = np.linalg.norm(body[:, J_WRIST_R], axis=1)
+
+    # 帧率归一：仅缩放时间差分类 dim（速度/角速度），位置/距离/角度类保持
+    # （dim0 根高, dim23 朝向角, dim25-28 高度/距离 不动）
+    if speed_scale != 1.0:
+        VEL = [1, 2, 3, 4, 5] + list(range(6, 23)) + [24]
+        feat[:, VEL] *= speed_scale
 
     if T is not None:
         return resample_to_T(feat, T)

@@ -41,10 +41,11 @@ python scripts/train_framenet_thermal.py --fold 0 --arch resnet18 \
   --epochs 40 --save_dir outputs/thermal_2d_ab --workers 8 \
   || echo "⚠️ [1] resnet18 无crop 失败"
 
-echo "########## [2/3] FrameNet 从零 无crop 严格复刻（8ep 无LS lr3e-4）##########"
+echo "########## [2/3] FrameNet 从零 无crop 严格复刻（8ep 无LS lr3e-4 仅翻转）##########"
 python scripts/train_framenet_thermal.py --fold 0 --arch framenet \
   --num_frames 8 --size 112 --sample_mode segment --gray_norm \
-  --epochs 8 --no_smooth --lr 3e-4 --save_dir outputs/thermal_2d_ab --workers 8 \
+  --epochs 8 --no_smooth --lr 3e-4 --no_balanced --flip_only \
+  --save_dir outputs/thermal_2d_ab --workers 8 \
   || echo "⚠️ [2] 严格复刻 失败"
 
 echo "########## [3/3] FrameNet 从零 无crop 长训（40ep LS0.1）##########"

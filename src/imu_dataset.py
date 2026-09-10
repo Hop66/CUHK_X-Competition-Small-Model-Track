@@ -60,6 +60,19 @@ def _parse_time(s) -> float:
     return float(pd.Timestamp(s).timestamp())
 
 
+# test down 文件是英文列名（DeviceName/AccX.../AsX...），train 是中文 → 统一映射
+_COL_MAP = {
+    "时间": "时间", "time": "时间",
+    "设备名称": "设备名称", "DeviceName": "设备名称",
+    "加速度X(g)": "加速度X(g)", "AccX(g)": "加速度X(g)", "AccX (g)": "加速度X(g)",
+    "加速度Y(g)": "加速度Y(g)", "AccY(g)": "加速度Y(g)", "AccY (g)": "加速度Y(g)",
+    "加速度Z(g)": "加速度Z(g)", "AccZ(g)": "加速度Z(g)", "AccZ (g)": "加速度Z(g)",
+    "角速度X(°/s)": "角速度X(°/s)", "AsX(°/s)": "角速度X(°/s)", "AsX (°/s)": "角速度X(°/s)",
+    "角速度Y(°/s)": "角速度Y(°/s)", "AsY(°/s)": "角速度Y(°/s)", "AsY (°/s)": "角速度Y(°/s)",
+    "角速度Z(°/s)": "角速度Z(°/s)", "AsZ(°/s)": "角速度Z(°/s)", "AsZ (°/s)": "角速度Z(°/s)",
+}
+
+
 def load_imu_sequence(imu_dir: Path) -> np.ndarray:
     """读 down/up 两个 csv，按设备分组 + 时间排序，返回 {设备名: (t_sec, feat[N,6])}。"""
     dev_data = {}  # 设备名 -> (times[], feats[N,6])
@@ -68,7 +81,12 @@ def load_imu_sequence(imu_dir: Path) -> np.ndarray:
         if not f.is_file():
             continue
         df = pd.read_csv(f, encoding="utf-8-sig")
-        if df.empty or "设备名称" not in df.columns:
+        if df.empty:
+            continue
+        # 列名统一（中文/英文兼容；test down 是英文 → 否则整个文件被丢 → 域"伪造"差异）
+        df = df.rename(columns={c: _COL_MAP.get(str(c).strip(), str(c).strip()) for c in df.columns})
+        if "设备名称" not in df.columns or "时间" not in df.columns \
+                or not all(c in df.columns for c in COL_ACC + COL_GYRO):
             continue
         for dev, grp in df.groupby("设备名称"):
             dev_name = _device_of(dev)

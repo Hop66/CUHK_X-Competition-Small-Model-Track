@@ -22,6 +22,8 @@ from src.dataset import DepthIRVideoDataset, ThermalVideoDataset, list_images
 from src.skeleton_dataset import SkeletonClipIndex, frame_num_of
 
 SHOULDER_L, SHOULDER_R = 11, 14  # H3.6M-17 左右肩
+# H3.6M-17 左右交换（镜像用）：(1,4)(2,5)(3,6) 腿，(11,14)(12,15)(13,16) 臂；与 MIRROR_PAIRS 一致
+H36M_FLIP_IDX = [0, 4, 5, 6, 1, 2, 3, 7, 8, 9, 10, 14, 15, 16, 11, 12, 13]
 
 
 def load_skeleton_map(pred_dir: Path) -> Dict[int, np.ndarray]:
@@ -91,6 +93,9 @@ class PoseAlignedVideoDataset(Dataset):
         return f"{clip.action_id}/{clip.subject}/{clip.sample}"
 
     def __getitem__(self, i: int):
+        if self.is_train:
+            # DataLoader fork 复制同一 self.rng → 各 worker 同序列；worker 种源+样本序号重派生
+            self.rng = np.random.default_rng(int((torch.initial_seed() + i) & 0x7FFFFFFF))
         clip = self.clips[i]
         skel_dir = self.skel_clips[i].pred_dir
         depth_map = list_images(clip.depth_dir)
@@ -150,6 +155,10 @@ class PoseAlignedVideoDataset(Dataset):
                 kps.append(np.zeros((17, 3), np.float32))
                 mask.append(0.0)
         kp = normalize3d(np.stack(kps, 0))                     # [T,17,3]
+        if do_flip:
+            # 修复：图像已水平翻转 → 骨架监督同步镜像（x 取反 + 左右关节交换），否则 ~50% 样本监督矛盾
+            kp[..., 0] *= -1.0
+            kp = kp[:, H36M_FLIP_IDX, :]
         skel = torch.from_numpy(kp)                            # [T,17,3]
         mask_t = torch.from_numpy(np.asarray(mask, np.float32))  # [T]
         return x, skel, mask_t, clip.action_id, clip.subject
@@ -196,6 +205,10 @@ class ThermalPoseAlignedVideoDataset(ThermalVideoDataset):
             kp = normalize3d(np.stack(kps, 0))                 # [T,17,3] 原生 3D 归一化
         else:
             kp = np.zeros((self.num_frames, 17, 3), np.float32)
+        if getattr(self, "_last_do_flip", False):
+            # 父类已翻转视频 → 骨架监督同步镜像（x 取反 + 左右关节交换），否则 ~50% 样本监督矛盾
+            kp[..., 0] *= -1.0
+            kp = kp[:, H36M_FLIP_IDX, :]
         skel = torch.from_numpy(kp)
         mask_t = torch.from_numpy(np.asarray(mask, np.float32))
         return x, skel, mask_t, clip.action_id, clip.subject

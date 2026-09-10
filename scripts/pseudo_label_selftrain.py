@@ -59,6 +59,9 @@ def _load_full_model(in_channels, ckpt, device):
         sd = sd["state_dict"]
     if "model" in sd:
         sd = sd["model"]
+    # 兼容 dual(SM) ckpt：键带 static.* 前缀 → 剥前缀取纯 R2+1D（丢弃 motion.*/a），否则原样
+    if any(k.startswith("static.") for k in sd):
+        sd = {k[len("static."):]: v for k, v in sd.items() if k.startswith("static.")}
     model.load_state_dict(sd)
     return model
 
@@ -71,7 +74,10 @@ def generate_pseudo_labels(args, device):
 
     # main：Depth+IR 4ch
     main_model = _load_full_model(4, args.main_ckpt, device)
-    main_crop = json.loads(Path(args.main_test_crop).expanduser().read_text(encoding="utf-8"))
+    main_crop_raw = json.loads(Path(args.main_test_crop).expanduser().read_text(encoding="utf-8"))
+    # 修复：dataset 按 {action_id}/{subject}/{sample} 查键（此处 = -1/{cid}/{cid}），测试缓存键是裸 cid
+    #       → 重映射成 dataset 会查的键，否则 teacher 在全帧上推理（与 0.73 提交 crop 分布不一致）
+    main_crop = {f"-1/{cid}/{cid}": w for cid, w in main_crop_raw.items()}
     main_clips = [type("C", (), {"subject": cid, "sample": cid, "action_id": -1,
                                  "depth_dir": dd, "ir_dir": ir})()
                   for cid, dd, ir in raw]
@@ -81,7 +87,8 @@ def generate_pseudo_labels(args, device):
 
     # thermal：3ch
     th_model = _load_full_model(3, args.thermal_ckpt, device)
-    th_crop = json.loads(Path(args.thermal_test_crop).expanduser().read_text(encoding="utf-8"))
+    th_crop_raw = json.loads(Path(args.thermal_test_crop).expanduser().read_text(encoding="utf-8"))
+    th_crop = {f"-1/{cid}/{cid}": w for cid, w in th_crop_raw.items()}
     th_clips = [type("C", (), {"subject": cid, "sample": cid, "action_id": -1,
                                "thermal_dir": dd.parent / "Thermal"})()
                 for cid, dd, _ in raw]
@@ -140,7 +147,9 @@ def evaluate(model, loader, device):
 
 def selftrain(args, device):
     root = Path(args.train_root).expanduser()
-    crop = json.loads(Path(args.crop_cache).expanduser().read_text(encoding="utf-8"))
+    crop_path = args.crop_cache or ("bbox_thermal_train.json" if args.modality == "thermal"
+                                    else "bbox_train.json")
+    crop = json.loads(Path(crop_path).expanduser().read_text(encoding="utf-8"))
     in_channels = 3 if args.modality == "thermal" else 4
     ds_cls = ThermalVideoDataset if args.modality == "thermal" else DepthIRVideoDataset
     idx_cls = build_thermal_index if args.modality == "thermal" else build_train_index
@@ -168,6 +177,14 @@ def selftrain(args, device):
         else:
             pseudo_clips.append(type("C", (), {"action_id": p["label"], "subject": cid,
                                                "sample": cid, "depth_dir": dd, "ir_dir": ir}))
+    # 修复：伪 clip 真实来源是测试集（裸 cid）→ 把测试 crop 重映射进假训练键 {label}/{cid}/{cid}，
+    #       否则伪样本全帧、与真样本有 crop 混用（历史伪标签负结果根因）
+    _tc_src = args.thermal_test_crop if args.modality == "thermal" else args.main_test_crop
+    _tc = json.loads(Path(_tc_src).expanduser().read_text(encoding="utf-8")) \
+        if Path(_tc_src).expanduser().exists() else {}
+    for _cid, _p in pseudo.items():
+        if _cid in _tc:
+            crop[f"{_p['label']}/{_cid}/{_cid}"] = _tc[_cid]
     print(f"[selftrain] modality={args.modality} 真训练={len(tr_real)} "
           f"伪标签={len(pseudo_clips)}（weight={args.pseudo_weight}）", flush=True)
 
@@ -248,7 +265,8 @@ def main():
     ap.add_argument("--main_test_crop", type=str, default="bbox_test.json")
     ap.add_argument("--thermal_test_crop", type=str, default="bbox_thermal_test.json")
     # 自训练
-    ap.add_argument("--crop_cache", type=str, default="bbox_thermal_train.json")
+    ap.add_argument("--crop_cache", type=str, default="",
+                    help="训练 crop 缓存；缺省按 modality 自动选（否则 main 会误用 thermal 缓存）")
     ap.add_argument("--pseudo_json", type=str, default="outputs/pseudo_labels.json")
     ap.add_argument("--pseudo_k", type=int, default=120, help="动态 top-K 伪标签样本数")
     ap.add_argument("--pseudo_weight", type=float, default=0.5,

@@ -85,7 +85,8 @@ def normalize_h36m(kp: np.ndarray, conf: np.ndarray) -> tuple:
     kp = kp - pelvis
     shoulder = np.linalg.norm(kp[11] - kp[14])  # L肩-R肩 2D 距离
     if shoulder < 1e-6 or not np.isfinite(shoulder):
-        return kp, conf * 0.0  # 肩宽不可靠 → 置信度置 0 让训练 mask
+        # 失效帧 → 全零占位（下游按 conf==0 硬 mask；不再返回像素尺度残值 + sigmoid(0)=0.5 半权泄漏）
+        return np.zeros_like(kp), np.zeros_like(conf)
     return kp / shoulder, conf
 
 
@@ -126,6 +127,9 @@ def main():
         dst.parent.mkdir(parents=True, exist_ok=True)
         if dst.is_file():
             skip += 1
+            if skip == 1:
+                print("[skel] ⚠️ 存在旧 npz 直接跳过；若缓存产自修复前版本，请先删除输出目录再重跑",
+                      flush=True)
             continue
         files = load_frames(c.thermal_dir)
         if not files:
@@ -136,6 +140,9 @@ def main():
         for f in files:
             img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
             if img is None:
+                # 不可读帧 → 占位（同无检测分支），保持时间轴均匀
+                kps.append(np.zeros((17, 2), np.float32))
+                confs.append(np.zeros(17, np.float32))
                 continue
             if img.dtype == np.uint16:
                 img = (img / 65535.0 * 255.0).astype(np.uint8)
@@ -153,7 +160,10 @@ def main():
                 pred = model(tensor)[0]
             scores = pred["scores"].cpu().numpy()
             if len(scores) == 0 or scores[0] < 0.5:
-                continue  # 无检测 → 跳过该帧（双视角模型按帧数对齐，会 mask 缺失）
+                # 无检测 → 占位帧（全零 kp + conf 0）保持时间索引对齐（不再跳过致 2D 时间轴非均匀错位）
+                kps.append(np.zeros((17, 2), np.float32))
+                confs.append(np.zeros(17, np.float32))
+                continue
             kpt = pred["keypoints"].cpu().numpy()[0]  # [17,3] = x,y,score
             ksc = pred["keypoints_scores"].cpu().numpy()[0]  # [17]
             # COCO 顺序 -> H3.6M 顺序（重排 12 + 派生 4）

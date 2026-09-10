@@ -179,6 +179,9 @@ class DualSkeletonDataset(Dataset):
             idx = self._uniform(kp2.shape[0])
             kp2 = kp2[idx]
             conf = conf[idx]
+            # 硬 mask 必须在归一化前判定：原始 conf==0（失效关节/占位帧）；
+            # 归一化后判会被 sigmoid(0)=0.5 吞掉，mask 永不触发
+            _z = conf <= 1e-6
             if self.conf_norm == "sigmoid":
                 conf = _conf_norm_sigmoid(conf)
             elif self.conf_norm == "none":
@@ -188,6 +191,8 @@ class DualSkeletonDataset(Dataset):
                 conf = np.clip((conf - lo) / max(hi - lo, 1e-8), 0.0, 1.0)
             else:
                 raise ValueError(f"unknown conf_norm={self.conf_norm}")
+            conf[_z] = 0.0
+            kp2[_z] = 0.0
             x2 = np.concatenate([kp2, conf[..., None]], axis=-1).astype(np.float32)
             if self.is_train:
                 x2 = self._aug_2d(x2)
@@ -222,12 +227,16 @@ class Thermal2DSkeletonDataset(DualSkeletonDataset):
         idx = self._uniform(kp2.shape[0])
         kp2 = kp2[idx]
         conf = conf[idx]
+        # 硬 mask 必须在归一化前判定（原始 conf==0）；归一化后判会被 sigmoid(0)=0.5 吞掉
+        _z = conf <= 1e-6
         if self.conf_norm == "sigmoid":
             conf = _conf_norm_sigmoid(conf)
         elif self.conf_norm == "none":
             conf = np.ones_like(conf)
         else:
             raise ValueError(f"unknown conf_norm={self.conf_norm}")
+        conf[_z] = 0.0
+        kp2[_z] = 0.0
         x2 = np.concatenate([kp2, conf[..., None]], axis=-1).astype(np.float32)
         if self.is_train:
             x2 = self._aug_2d(x2)

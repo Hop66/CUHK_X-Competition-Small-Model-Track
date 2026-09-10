@@ -67,6 +67,8 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     root = Path(args.train_root).expanduser()
+    print(f"[train_main_baseline] start device={device} aug={args.aug_strength} "
+          f"frames={args.num_frames} fold={args.fold}", flush=True)
     clips = build_train_index(root)
     folds = split_by_subject(clips, n_folds=args.folds)
     crop_cache = json.loads(Path(args.crop_cache).expanduser().read_text(encoding="utf-8"))
@@ -84,9 +86,10 @@ def main():
         va_ds = DepthIRVideoDataset(va_clips, args.num_frames, args.size, False, crop_cache,
                                     use_frame_diff=False)
         tr_loader = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True,
-                               num_workers=args.workers, pin_memory=True, drop_last=True)
+                               num_workers=args.workers, pin_memory=True, drop_last=True,
+                               timeout=300)
         va_loader = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False,
-                               num_workers=args.workers, pin_memory=True)
+                               num_workers=args.workers, pin_memory=True, timeout=300)
         print(f"device={device} fold{fi} train={len(tr_ds)} val={len(va_ds)} "
               f"CE baseline aug={args.aug_strength}", flush=True)
 
