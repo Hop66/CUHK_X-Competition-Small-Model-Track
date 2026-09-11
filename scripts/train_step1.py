@@ -37,8 +37,17 @@ from src.model import build_model
 # 难对集（twin_v3 数据驱动审计 + 骨架 v3 特征 62-65% 判别力验证）:
 # 骨架作为"难对选择器"（LUPI 修正函数）：训练时难对类样本 CE 梯度加权，
 # 逼 main 在易混淆类上更专注；纯 loss 侧，不动输入/架构/监督 → 规避历史雷区。
-HARD_PAIRS = [(13, 12), (22, 21), (8, 10), (18, 17), (26, 24)]
+#
+# 09-11 更新: 难对表 = 「跨折稳定 OOF 混淆对 (总≥6次, ≥2折)」经 main2c 判别力精选:
+#   只保留 main(2候选内)argmax 0.65~0.85 的可学难对 —— 排除已会(>0.85: 6↔7/9↔10/33↔34…)
+#   与纯噪声(<0.65: 12↔13/21↔22 弱判别, 24↔26 数据不可分)。
+# 来源: outputs/oof/{main,thermal}_oof.pkl 训练集逐clip实测(非测试集推测), 双塔同步共用。
+HARD_PAIRS = [
+    (0, 1), (6, 37), (7, 37), (8, 9), (8, 10), (8, 15),
+    (8, 18), (11, 14), (17, 18), (18, 20), (38, 39),
+]
 HPID = {a for p in HARD_PAIRS for a in p}
+print(f"[train_step1] HARD_PAIRS n={len(HARD_PAIRS)} 类簇={len(HPID)}/40", flush=True)
 
 
 def _hp_weights(y, w):
@@ -47,6 +56,34 @@ def _hp_weights(y, w):
     m = torch.ones_like(y.float())
     m[_hp] = float(w)
     return m
+
+
+def hp_focal_loss(out, y, gamma=2.0, label_smoothing=0.0):
+    """难对区 Focal loss：限制在难对类(HPID)内使用 (1-p)^γ 逐样本动态加权。
+    非难对样本权重保持 1（等价普通 CE）；难对样本按其实测难度 (1-p)^γ 加权。
+    与多任务可学习 σ 平衡配套使用：L = CE(全量) + λ·e^{-σ}·HP_Focal + σ。"""
+    import numpy as _np
+    l = F.cross_entropy(out, y, reduction='none', label_smoothing=label_smoothing)
+    pt = torch.exp(-l)  # p_t = exp(-CE)
+    mask = torch.as_tensor(_np.isin(y.cpu().numpy(), list(HPID)),
+                           dtype=torch.float32, device=out.device)
+    # 难对样本: (1-pt)^γ · CE；非难对样本: CE (保持尺度不漂移)
+    mod = mask * (1.0 - pt).pow(gamma) + (1.0 - mask)
+    return (l * mod).mean()
+
+class _LossBalancer:
+    """多任务可学习权重 (Kendall 2018): L = Σ_i (L_i/(2σ_i²) + log σ_i)。
+    本题: 任务1=全量CE, 任务2=难对区Focal。σ 反向自动平衡两者梯度尺度，
+    替代手工 hardpair_w=2 带来的 1.59× loss 尺度漂移。"""
+    def __init__(self, device, lambda_hp=1.0, init_sigma=0.0, gamma=2.0):
+        self.log_sigma = torch.nn.Parameter(torch.zeros(1, device=device))
+        self.lambda_hp = lambda_hp
+        self.gamma = gamma
+        self.opt = torch.optim.Adam([self.log_sigma], lr=1e-2)
+    def __call__(self, loss_all, loss_hp):
+        sigma = torch.exp(self.log_sigma)
+        # 任务2 权重 e^{-σ}·λ；任务1 权重 1；加 logσ 正则防 σ→∞
+        return loss_all + self.lambda_hp * torch.exp(-self.log_sigma) * loss_hp + self.log_sigma, sigma
 
 
 def evaluate(model, loader, device, label_smoothing=0.0):
@@ -121,7 +158,8 @@ def train_fold(model, train_loader, val_loader, device, epochs, lr, fold, save_p
                cb_loss_params=None, freeze_epochs=0, freeze_scale=0.3,
                freeze_train=("stem", "layer3", "layer4"),
                mixup_alpha=0.0, cutmix_alpha=0.0, erase_prob=0.0, ema_decay=0.0,
-               grad_clip=0.0, rsc_drop=0.0, hardpair_w=0.0, optim_type="adam"):
+               grad_clip=0.0, rsc_drop=0.0, hardpair_w=0.0, hp_focal_gamma=0.0,
+               optim_type="adam"):
     """cb_loss_params: dict with 'class_counts' and 'beta', or None for standard CE."""
     opt = _make_opt(optim_type, model, lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
@@ -202,6 +240,10 @@ def train_fold(model, train_loader, val_loader, device, epochs, lr, fold, save_p
                         l = F.cross_entropy(out, y, reduction='none', label_smoothing=label_smoothing)
                         w = _hp_weights(y, hardpair_w)
                         loss = (l * w).mean()
+                    elif hp_focal_gamma > 0:
+                        # 难对区 Focal(逐样本难度加权)：(1-p)^γ 只在难对类生效; 自洽不漂移
+                        loss = hp_focal_loss(out, y, gamma=hp_focal_gamma,
+                                             label_smoothing=label_smoothing)
                     else:
                         loss = crit(out, y)
                 loss.backward()
@@ -225,14 +267,23 @@ def train_fold(model, train_loader, val_loader, device, epochs, lr, fold, save_p
         sched.step()
         if full:
             # 全量模式：无 val，每 save_every ep 保存快照 + 最后 ep 保存最终（CosineAnnealing 收敛）
+            # fix(09-11): 快照按 ep 编号保留(_full_seed42_ep{ep}.pth) → 可后期选点防过拟合；
+            #            旧版覆盖式只存最后一个(80ep 冗余过拟合, 主链注释自认 ep70 达峰)
             if save_path is not None and ((ep + 1) % save_every == 0 or ep == epochs - 1):
+                snap = save_path.with_name(save_path.stem + f"_ep{ep+1}" + save_path.suffix)
+                # 同时保存快照(带 ep 后缀) 与最终(裸名, 兼容 quantize_pack/ensemble 既有依赖)
+                _final = (ep + 1 == epochs)
                 if ema_state is not None:
                     online = {k: v.detach().clone() for k, v in model.state_dict().items()}
                     model.load_state_dict(ema_state)
-                    torch.save(model.state_dict(), save_path)
+                    torch.save(model.state_dict(), snap)
+                    if _final:
+                        torch.save(model.state_dict(), save_path)
                     model.load_state_dict(online)   # 恢复在线权重, 下一 ep 训练不受污染
                 else:
-                    torch.save(model.state_dict(), save_path)
+                    torch.save(model.state_dict(), snap)
+                    if _final:
+                        torch.save(model.state_dict(), save_path)
             print(f"[{fold}] ep{ep+1}/{epochs} loss={run_loss/max(n,1):.4f} "
                   f"(FULL) saved={save_path} ({time.time()-t0:.1f}s)", flush=True)
             continue
@@ -305,6 +356,9 @@ def main():
     ap.add_argument("--hardpair_w", type=float, default=0.0,
                     help=">0: 难对区样本 CE 梯度加权 ×w（骨架难对选择器, LUPI 修正函数精神；"
                          "HARD 5 对=13/12,22/21,8/10,18/17,26/24。纯 loss 侧不动架构）")
+    ap.add_argument("--hp_focal_gamma", type=float, default=0.0,
+                    help=">0: 难对区 Focal loss γ(仅难对类逐样本(1-p)^γ加权, 非难对保持1; "
+                         "替代 hardpair_w 的粗粒度加权, 自洽不漂移尺度)")
     ap.add_argument("--optim", type=str, default="adam", choices=["adam", "sgd"],
                     help="优化器: adam(现状) / sgd(maction2 标配, momentum0.9; SGD 时用较大 lr 如 1e-2)")
     ap.add_argument("--seed", type=int, default=42, help="全量模式随机种子（多 seed 集成用）")
@@ -398,6 +452,7 @@ def main():
                    erase_prob=args.erase_prob,
                    ema_decay=args.ema_decay, grad_clip=args.grad_clip,
                    rsc_drop=args.rsc_drop, hardpair_w=args.hardpair_w,
+                   hp_focal_gamma=args.hp_focal_gamma,
                    optim_type=args.optim)
         print(f"==== FULL DONE: {save_path} ====", flush=True)
         return
@@ -466,6 +521,7 @@ def main():
                           erase_prob=args.erase_prob,
                           ema_decay=args.ema_decay, grad_clip=args.grad_clip,
                           rsc_drop=args.rsc_drop, hardpair_w=args.hardpair_w,
+                          hp_focal_gamma=args.hp_focal_gamma,
                           optim_type=args.optim)
         fold_accs.append(best)
         print(f"== fold {fi} best val = {best:.4f} -> {save_path}")
