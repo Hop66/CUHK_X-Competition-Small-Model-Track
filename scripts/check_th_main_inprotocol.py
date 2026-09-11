@@ -6,7 +6,12 @@
 
 方案: 用 s42 fold0 fp32 (main_full/r2plus1d34_depthir_full_seed42) 跑 train fold0 的 val 折
       (subjects 10,11,25,26 留出), 评估协议内 main 单模 vs main+th prob_avg (均 flip_tta+quantize)。
-      s42 是 fold0 模型 → 这三 subjects 对它 = 干净 OOF (训练没见过), 且协议 ~ test。
+
+⚠️❌ P0 协议判废 (2026-09-11, 见 idea.md §B):
+  `main_full/..._full_seed42.pth` 是 FULL(全量 18 被试) 训练的模型, 已见过所有 18 subjects
+  (含所谓 "fold0 val 折") → 拿它在训练集 fold0 上评 "OOF" 是**泄漏**, 结论无效。
+  `quantize_pack` 对单 ckpt 命名为 *_fold0_int5 只是列表下标, 不代表它是 fold0 模型。
+  此脚本数字**作废**, 仅保留作为"协议错误"的考古记录; 修复需重训真正的 fold0 模型。
 """
 import argparse
 import json

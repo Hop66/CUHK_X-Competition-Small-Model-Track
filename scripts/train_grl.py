@@ -33,6 +33,24 @@ from src.model import build_model
 from src.split import split_by_subject
 
 
+class SubjectIndexDataset(torch.utils.data.Dataset):
+    """P0修复(G): GRL 需要 (x, y, subject_idx) 三元组。
+    包装底层 Dataset, __getitem__ 从类上解析得 subject_idx —— 替代无效的
+    `train_ds.__getitem__ = new_getitem` monkey-patch (special method 从类查,
+    实例赋值不生效)。
+    """
+    def __init__(self, base_ds, subject_index):
+        self.base_ds = base_ds
+        self.subject_index = subject_index  # clip i -> subject int index
+
+    def __len__(self):
+        return len(self.base_ds)
+
+    def __getitem__(self, i):
+        x, y, _ = self.base_ds[i]
+        return x, y, self.subject_index[i]
+
+
 # ------------------------------------------------------------------ GRL 模块
 class GradientReversalLayer(torch.autograd.Function):
     """梯度反转：前向恒等，反向乘 -lambda。"""
@@ -98,13 +116,14 @@ class ActionNetWithSubjectHead(nn.Module):
         """前向：动作 logits + （可选）主体 logits。
 
         Args:
-            x: [B, C, T, H, W]
+            x: [B, T, C, H, W]  (与 train_step1 / 数据集一致)
             return_subject: 是否计算主体 logits（训练时需要，推理时不需要）
 
         Returns:
             action_logits: [B, 40]
             subject_logits: [B, num_subjects] 或 None
         """
+        # 注意: build_model("r2plus1d")/R2Plus1D18 期望 [B,T,C,H,W](数据集格式), 无需 permute
         self._feature_cache = None
         action_logits = self.backbone(x)
 
@@ -163,7 +182,9 @@ def train_grl(model, train_loader, val_loader, device, epochs, lr, fold, save_pa
 
             loss_action = crit_action(action_logits, y)
             loss_subject = crit_subject(subject_logits, subj_idx)
-            loss = loss_action + lambda_grl * loss_subject
+            # P0修复(G): 外层不再乘 λ —— GRL 层内 backward 已乘 lambd(标准 DANN)。
+            # 原版 loss_action + lambda_grl*loss_subject 会让 backbone 收到近似 λ² 的对抗强度。
+            loss = loss_action + loss_subject
 
             loss.backward()
             opt.step()
@@ -267,6 +288,9 @@ def main():
         else:
             train_ds = DepthIRVideoDataset(tr_clips, args.num_frames, args.size, True, crop_cache,
                                            aug_strength=args.aug_strength, sample_mode=args.sample_mode)
+        # P0修复(G): 先包装(返回 subject_idx), 再建 loader —— 包装必须在 DataLoader 之前
+        subject_index = [subject_to_idx[c.subject] for c in tr_clips]
+        train_ds = SubjectIndexDataset(train_ds, subject_index)
         sampler = build_balanced_sampler([c.action_id for c in tr_clips])
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
                                   num_workers=args.workers, pin_memory=True, drop_last=True)
@@ -276,16 +300,6 @@ def main():
                                          weights_path=args.weights or None).to(device)
         save_path = Path(args.save_dir).expanduser() / f"{args.backbone}_{args.modality}_grl_full.pth"
         save_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # 给每个 clip 附加主体索引
-        for c in tr_clips:
-            c.subject_idx = subject_to_idx[c.subject]
-        # 重写 dataset 的 getitem 以返回 subject_idx
-        orig_getitem = train_ds.__getitem__
-        def new_getitem(i):
-            x, y, _ = orig_getitem(i)
-            return x, y, train_ds.clips[i].subject_idx
-        train_ds.__getitem__ = new_getitem
 
         train_grl(model, train_loader, None, device, args.epochs, args.lr, "full",
                   save_path, lambda_grl=args.lambda_grl, label_smoothing=args.label_smoothing)
@@ -311,6 +325,9 @@ def main():
             val_ds = DepthIRVideoDataset(va_clips, args.num_frames, args.size, False, crop_cache,
                                          sample_mode=args.sample_mode)
 
+        # P0修复(G): 先包装(返回 subject_idx), 再建 loader
+        subject_index = [subject_to_idx[c.subject] for c in tr_clips]
+        train_ds = SubjectIndexDataset(train_ds, subject_index)
         sampler = build_balanced_sampler([c.action_id for c in tr_clips])
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
                                   num_workers=args.workers, pin_memory=True, drop_last=True)
@@ -320,15 +337,6 @@ def main():
         model = ActionNetWithSubjectHead(args.backbone, num_classes=40, num_subjects=num_subjects,
                                          in_channels=in_channels, n_segment=args.num_frames,
                                          weights_path=args.weights or None).to(device)
-
-        # 附加主体索引
-        for c in tr_clips:
-            c.subject_idx = subject_to_idx[c.subject]
-        orig_getitem = train_ds.__getitem__
-        def new_getitem(i, ds=train_ds):
-            x, y, _ = orig_getitem(i)
-            return x, y, ds.clips[i].subject_idx
-        train_ds.__getitem__ = new_getitem
 
         save_path = Path(args.save_dir).expanduser() / f"{args.backbone}_{args.modality}_grl_fold{fi}.pth"
         save_path.parent.mkdir(parents=True, exist_ok=True)

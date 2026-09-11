@@ -94,10 +94,14 @@ def main():
             hook = None
             if args.save_feats:
                 # 抓 encoder 输出 (fc.Identity 前的 512d)
+                # ⚠️ P0修复(F): flip 时 logits=orig+flip; 原只抓 flip 一遍=协议不对称.
+                #    现在累计两遍 hook 取平均, 与 40d logits 同协议(orig+flip).
                 def _make_hook():
-                    buf = {}
+                    buf = {"n": 0.0}
                     def _h(m, i, o):
-                        buf["f"] = o.detach().float().cpu().numpy()
+                        f = o.detach().float().cpu().numpy()
+                        buf["f"] = buf.get("f", 0.0) + f
+                        buf["n"] += 1.0
                     return buf, _h
                 hbuf, hfn = _make_hook()
                 hook = model.encoder.register_forward_hook(hfn)
@@ -109,7 +113,9 @@ def main():
                         o = o + model(torch.flip(x, dims=(-1,)))
                     logits[s:s + len(o)] = o.float().cpu().numpy()
                     if args.save_feats:
-                        feats[s:s + len(o)] = hbuf["f"][:len(o)]
+                        feats[s:s + len(o)] = (hbuf["f"] / hbuf["n"])[:len(o)]
+                        hbuf["f"] = 0.0
+                        hbuf["n"] = 0.0
                     s += len(o)
             if hook is not None:
                 hook.remove()
@@ -142,9 +148,11 @@ def main():
         model.eval()
         logits = np.zeros((len(raw), 40), np.float32)
         feats = np.zeros((len(raw), 512), np.float32) if args.save_feats else None
-        hbuf = {"f": np.zeros((args.batch_size, 512), np.float32)}
+        hbuf = {"f": 0.0, "n": 0.0, "b": args.batch_size}
         def _h(m, i, o):
-            hbuf["f"] = o.detach().float().cpu().numpy()
+            # P0修复(F): 累计两遍(orig+flip)取平均, 与 40d logits 同协议
+            hbuf["f"] = hbuf["f"] + o.detach().float().cpu().numpy()
+            hbuf["n"] += 1.0
         hook = model.encoder.register_forward_hook(_h) if args.save_feats else None
         s = 0
         with torch.no_grad():
@@ -155,7 +163,9 @@ def main():
                     o = o + model(torch.flip(x, dims=(-1,)))
                 logits[s:s + len(o)] = o.float().cpu().numpy()
                 if args.save_feats:
-                    feats[s:s + len(o)] = hbuf["f"][:len(o)]
+                    feats[s:s + len(o)] = (hbuf["f"] / hbuf["n"])[:len(o)]
+                    hbuf["f"] = 0.0
+                    hbuf["n"] = 0.0
                 s += len(o)
         if hook is not None:
             hook.remove()

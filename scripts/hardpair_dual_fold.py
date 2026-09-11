@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""双塔同步难对重权 fold0 单折验证。
+"""双塔同步难对重权 fold0 验证（P0 修复版, 2026-09-11）。
 
-对新训 main/th fold0 (hardpair_w) 在 fold0 val 推理 logits, 与基线 OOF(main_oof/
-thermal_oof 同 fold0) 做两路对比:
-  R(基线双塔): base_m + base_t
-  A(难对双塔): hp_m + hp_t
-逐 clip 融合(软max sum) 报错统计: 总 acc + 难对区(H11)错误数。
-判定: A 总 acc > R 且难对区错误显著下降 → 双塔同步难对重权有效(fold 证据),
-      再上 3 折/full(seed42)。若无效 → 难对训练侧判负(骨架/IMU 已无独立信息)。
+⚠️ 协议声明（修复 double-softmax + 撤销绝对增益声称）:
+  - 原版 softmax_logits() 先 sf 一次, eval_fusion 又 sf 一次 → double-softmax。
+  - 实测 double-softmax 对 argmax 影响 ~0.1pt（单调变换），但不符合提交协议。
+  - 正确协议: 所有 logits **softmax 恰好一次**再融合（与 prob_avg 一致）。
+  - 本文件仅作 fold 诊断; 因 OOF 模型是 baseline_aug2 (≠锚 s42 全数据),
+    任何数字**不构成"锚有效 AB"**; 锚级判断只能跑 full(seed42) + int5 + flip 同协议。
 
 用法: python scripts/hardpair_dual_fold.py
 """
@@ -56,10 +55,12 @@ def infer(model, loader, device):
 
 
 def eval_fusion(pm, pt, keys, labels):
+    """融合评估: pm/pt 已是 softmax 概率(恰一次), sum 后 argmax (与 prob_avg 同协议)。
+    ⚠️ 修复: 原版这里又 sf() → double-softmax; 现在要求调用方传入 exactly-once softmax。"""
     tot = corr = 0
     hp_e = nh_e = 0
     for k, g in zip(keys, labels):
-        fu = sf(pm[k]) + sf(pt[k])
+        fu = pm[k] + pt[k]
         p = int(fu.argmax())
         tot += 1
         corr += (p == g)

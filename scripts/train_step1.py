@@ -309,7 +309,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train_root", type=str, default="~/Multimodal/data/Training/HAR")
     ap.add_argument("--backbone", type=str, default="r2plus1d",
-                    choices=["r2plus1d", "r2plus1d34", "tsm_resnet18"])
+                    choices=["r2plus1d", "r2plus1d34", "tsm_resnet18", "tsm_mobilenet"])
     ap.add_argument("--weights", type=str, default="", help="IG-65M 预训练权重路径（r2plus1d34 用）")
     ap.add_argument("--num_frames", type=int, default=16)
     ap.add_argument("--size", type=int, default=128)
@@ -317,6 +317,9 @@ def main():
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--folds", type=int, default=3)
+    ap.add_argument("--fold_split", type=str, default="",
+                    help="P1协议: 环境平衡 dev_folds json 路径(含 locked+dev_folds); "
+                         "缺省用 split_by_subject(3折, 但 A/B 不平衡)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--crop_cache", type=str, default="", help="bbox_cache.json 路径，缺省不裁剪")
     ap.add_argument("--ir_mask", action="store_true", help="IR Otsu 人像掩码抑制 Depth 背景")
@@ -370,6 +373,8 @@ def main():
     ap.add_argument("--gray_norm", action="store_true",
                     help="仅 thermal：用灰度拉伸归一化 (x-0.5)/0.25 替代 Kinetics norm"
                          "（14th-place baseline 用；thermal 单通道灰度更匹配）")
+    ap.add_argument("--use_mixstyle", action="store_true",
+                    help="P1: 训练期 MixStyle 域增广(仅 tsm_mobilenet 支持; 测试恒等零成本)")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -398,7 +403,35 @@ def main():
         skel_map = {f"{c.action_id}/{c.subject}/{c.sample}": str(c.pred_dir) for c in _sk}
         print(f"skel_map: {len(skel_map)} clips", flush=True)
 
-    folds = split_by_subject(clips, n_folds=args.folds)
+    # P1 协议(09-11): 默认 split_by_subject(3折, A/B 不平衡);
+    # 若给 --fold_split <json> 则用环境平衡 dev_folds(每折 Env-A/B 各半) — 审计要求。
+    import os as _os
+    _fs = args.fold_split
+    _locked_set = set()
+    if _fs and _os.path.exists(_fs):
+        import json as _json
+        _spec = _json.loads(Path(_fs).expanduser().read_text(encoding="utf-8"))
+        _locked_set = set(_spec.get("locked", []))
+        _folds_spec = _spec.get("dev_folds") or []
+        _sub2idx = {}
+        for _i, _c in enumerate(clips):
+            _sub2idx.setdefault(_c.subject, []).append(_i)
+        folds = []
+        for _fd in _folds_spec:
+            _tr_s, _va_s = set(_fd["tr"]), set(_fd["va"])
+            _tr_idx = [i for s in _tr_s for i in _sub2idx.get(s, [])]
+            _va_idx = [i for s in _va_s for i in _sub2idx.get(s, [])]
+            # 剔除 locked subjects(绝不该出现在 dev 训练/验证)
+            _tr_idx = [i for i in _tr_idx if clips[i].subject not in _locked_set]
+            _va_idx = [i for i in _va_idx if clips[i].subject not in _locked_set]
+            folds.append((_tr_idx, _va_idx))
+        if not folds:
+            print("⚠️ fold_split 无有效 dev_folds, 回退 split_by_subject", flush=True)
+            folds = split_by_subject(clips, n_folds=args.folds)
+        print(f"[protocol] 用环境平衡 dev_folds: {len(folds)} 折, "
+              f"locked={sorted(_locked_set)}", flush=True)
+    else:
+        folds = split_by_subject(clips, n_folds=args.folds)
     target_folds = range(len(folds)) if args.fold < 0 else [args.fold]
 
     # ================= FULL 全量训练（不分折，多 seed） =================
@@ -424,7 +457,8 @@ def main():
                                   num_workers=args.workers, pin_memory=True, drop_last=True)
         model = build_model(args.backbone, num_classes=40, in_channels=in_channels,
                             n_segment=args.num_frames,
-                            weights_path=args.weights or None).to(device)
+                            weights_path=args.weights or None,
+                            use_mixstyle=args.use_mixstyle).to(device)
         save_path = None
         if args.save_dir:
             d = Path(args.save_dir).expanduser()
@@ -496,7 +530,8 @@ def main():
 
         model = build_model(args.backbone, num_classes=40, in_channels=in_channels,
                             n_segment=args.num_frames,
-                            weights_path=args.weights or None).to(device)
+                            weights_path=args.weights or None,
+                            use_mixstyle=args.use_mixstyle).to(device)
         save_path = None
         if args.save_dir:
             d = Path(args.save_dir).expanduser()

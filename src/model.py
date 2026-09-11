@@ -194,12 +194,52 @@ class TSMResNet18(nn.Module):
         return x.view(B, T, -1).mean(dim=1)  # 帧级 logits 平均（TSM 惯例）
 
 
+class TSMMobileNetV2(nn.Module):
+    """MobileNetV2 + TSM (P1, 2026-09-11, 见 idea.md P1 TSM-MobileNetV2).
+    仅 2.3M 参数 — 与 R2+1D34(强) 误差互补, 且省预算(ensemble 多样性真正来源)。
+    TSM 插入 features[12] 后的第二段(用时序移位打乱通道)。可选 MixStyle(域增广)。"""
+    def __init__(self, num_classes: int = 40, in_channels: int = 4,
+                 n_segment: int = 16, pretrained: bool = True, use_mixstyle=False):
+        super().__init__()
+        import torchvision.models as tvm
+        w = tvm.MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
+        try:
+            net = tvm.mobilenet_v2(weights=w)
+        except Exception:
+            net = tvm.mobilenet_v2(weights=None)
+        if in_channels != 3:
+            net.features[0][0] = adapt_conv2d(net.features[0][0], in_channels)
+        self.features = net.features
+        self.tsm = TemporalShift(n_segment=n_segment)
+        self.ms = None
+        if use_mixstyle:
+            from src.mixstyle import MixStyle
+            self.ms = MixStyle(p=0.5, alpha=0.1)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(1280, num_classes)
+
+    def forward(self, x):  # [B, T, C, H, W] → [B, 40]
+        B, T, C, H, W = x.shape
+        x = x.reshape(B * T, C, H, W)
+        x = self.features(x)
+        x = self.tsm(x)
+        if self.ms is not None:
+            x = self.ms(x)
+        x = self.pool(x).flatten(1)
+        x = self.fc(x)
+        return x.view(B, T, -1).mean(dim=1)
+
+
 def build_model(name: str, num_classes: int = 40, in_channels: int = 4,
-                n_segment: int = 16, pretrained: bool = True, weights_path=None):
+                n_segment: int = 16, pretrained: bool = True, weights_path=None,
+                use_mixstyle: bool = False):
     if name == "r2plus1d":
         return R2Plus1D18(num_classes, in_channels, pretrained)
     if name == "r2plus1d34":
         return R2Plus1D34(num_classes, in_channels, weights_path)
     if name == "tsm_resnet18":
         return TSMResNet18(num_classes, in_channels, n_segment, pretrained)
+    if name == "tsm_mobilenet":
+        return TSMMobileNetV2(num_classes, in_channels, n_segment, pretrained,
+                              use_mixstyle=use_mixstyle)
     raise ValueError(f"unknown backbone: {name}")

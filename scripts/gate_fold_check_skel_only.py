@@ -9,6 +9,11 @@
 当 pred 落入难对类且 conf 在 [0.5, 0.85] 且 margin<tau → 骨架-only GBDT 换头。
 扫 tau 报整体/难对区 acc diff（无 oracle, 与 test 同机制）。
 用法: python scripts/gate_fold_check_skel_only.py
+
+⚠️ P0 协议声明 (2026-09-11, 见 idea.md):
+  - 已修: 二分类 GBDT 训练样本过滤到 (a,b) 各自区间(原版 a-vs-其余 ≠ test 的 a-vs-b)。
+  - 已知 selection-bias: tau/conf 网格在验证折上选择后报 best → 本脚本仅作机制诊断,
+    不构成可信增益; 最终判据须在 locked audit split。
 """
 import pickle
 import sys
@@ -86,8 +91,13 @@ def main():
         va_c = [sk[i] for i in va_idx]
         clfs = {}
         for a, b in HARD:
+            # ⚠️ P0修复(C): 训练样本只保留落在 (a,b) 的 clip —— 原版用全部 tr_c
+            #   (含所有 hard-pair 类), 导致分类器学的是 "a vs 其余" 而非 "a vs b",
+            #   与 test 端 make_test_gate_csv 的真正的 (a,b) 二分类不一致。
             mti = []
             for c in tr_c:
+                if c.action_id not in (a, b):
+                    continue
                 k = f"{c.action_id}/{c.subject}/{c.sample}"
                 if k in FE:
                     mti.append((k, FE[k]))

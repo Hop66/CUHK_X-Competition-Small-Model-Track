@@ -4,6 +4,20 @@
 > 主链锚 LB = 0.75124（main_s42 + th_nf32full, prob_avg + flip_tta）；当前最优提交 = 0.75621（骨架 gate）。
 > 本文件盘点所有已试方法，标注其数据、可靠性与证伪状态。**可靠性分级**: ✅LB 正 / ⚠️fold 正但未 LB / ❌已证伪 / 🔬未完全证伪（保留可能性）。
 
+> ## ⚠️⚠️ 2026-09-11 实验体系污染声明（重要, 见 doc/idea.md）
+> 下列历史结论**有效性降级**，原因是实验体系存在协议污染（独立审查 `idea.md` 确认）:
+> | 问题 | 影响 | 状态 |
+> |---|---|---|
+> | **B. full 模型被当 fold0 OOF** (`check_th_main_inprotocol`, main_full 全量训练却在训练集 fold0 上评"OOF") | 该实验泄漏, 结论作废 | ❌ 判废 |
+> | **C. gate fold 二分类器 a-vs-其余 ≠ test 的 a-vs-b** (`gate_fold_check_skel_only`) | 折叠验证与 test 机制不一致 + selection-bias | 🔧 已修过滤 + 标注 |
+> | **D. double-softmax** (`hardpair_dual_fold`) | 折叠融合用了 softmax(softmax(logits)), 与提交协议不符 | 🔧 已修 exactly-once |
+> | **E. +5.18 的 baseline 是坏融合**(aug2 融合 < 单 main) | 增益虚高, 真实约 +2pt 且在 wrong-host(full 不匹配难对表) 上转移失败(LB-2.49) | ❌ 不采信 |
+> | **F. 512d vs 40d 不同协议**(hook 只抓 flip 一遍) | "512d 无可利用信息"结论撤回 | 🔧 已修两遍平均 |
+> | **G. GRL 未可信验证**(monkey-patch 无效 + λ²) | GRL 方向从未有干净实验 | 🔧 已修(包装+去λ²) |
+>
+> **现状**: LB 0.75124 / 0.75621 作为"真实提交分数"保留; 但所有"方法增益/永久证伪"结论需在新协议下重验。
+> **新协议基建已就绪**: `outputs/locked_split.json`(locked 4人: Env-A user4/7 + Env-B user18/23) + `scripts/fair_eval.py` + `scripts/make_locked_split.py`。
+
 ---
 
 ## 0. 一句话总结当前状态
