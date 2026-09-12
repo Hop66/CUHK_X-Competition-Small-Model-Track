@@ -167,12 +167,31 @@ def main():
         va = valid()
         if va > best:
             best = va
-            best_sd = {k: v.detach().cpu().clone() for k, v in main_model.state_dict().items()}
+            # ⚠️ P0修复(09-12 审计): 原版只快照 main_model, skel/gate/proj_s/head 用最后epoch
+            #    → "best main + final adapter" 混搭，非一致 best checkpoint。
+            #    现在五个组件在 best 时全部深拷贝。
+            import copy as _copy
+            best_sd = {
+                "main": _copy.deepcopy(main_model.state_dict()),
+                "skel": _copy.deepcopy(skel_branch.state_dict()),
+                "gate": _copy.deepcopy(gate.state_dict()),
+                "proj_s": _copy.deepcopy(proj_s.state_dict()),
+                "head": _copy.deepcopy(head.state_dict()),
+            }
         print(f"[fold{args.fold}] ep{ep+1}/{args.epochs} loss={run/max(n,1):.4f} "
               f"val={va:.4f} best={best:.4f} ({time.time()-t0:.0f}s)", flush=True)
-    torch.save({"main": best_sd, "best_acc": best,
-                "skel": skel_branch.state_dict(), "gate": gate.state_dict(),
-                "proj_s": proj_s.state_dict(), "head": head.state_dict()},
+    if best_sd is None:
+        import copy as _copy
+        best_sd = {
+            "main": _copy.deepcopy(main_model.state_dict()),
+            "skel": _copy.deepcopy(skel_branch.state_dict()),
+            "gate": _copy.deepcopy(gate.state_dict()),
+            "proj_s": _copy.deepcopy(proj_s.state_dict()),
+            "head": _copy.deepcopy(head.state_dict()),
+        }
+    torch.save({"main": best_sd["main"], "best_acc": best,
+                "skel": best_sd["skel"], "gate": best_sd["gate"],
+                "proj_s": best_sd["proj_s"], "head": best_sd["head"]},
                outdir / f"gate_skel_fold{args.fold}.pth")
     print(f"== fold{args.fold} best={best:.4f} (对照 main16f=0.6695) ===", flush=True)
 

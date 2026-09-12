@@ -528,3 +528,618 @@ Thermal view B
 还有一个很重要的判断：**当前仓库并不是“0.75 已经做到极限”**。现阶段最多能说“当前 R2+1D + 当前不稳定实验体系停在 0.75 左右”。官方比赛最终要跑全新 private data，当前正好应该从“调 test predictions”切回“跨人、跨环境、轻量多样模型”的路线。([UbiComp/ISWC 2026](https://www.ubicomp.org/ubicomp-iswc-2026/cuhk-x-competition/?utm_source=chatgpt.com "CUHK-X Competition - UbiComp/ISWC 2026"))
 
 如果你愿意，我下一步可以直接基于这个 GitHub 仓库开始做第一轮代码整改：**先修 `hardpair_dual_fold.py`、gate 验证、`check_th_main_inprotocol.py`、GRL 和统一的 fair-eval 脚本，并把修改整理成一个独立 branch/PR**。这样后续所有新实验就可以建立在同一个可信协议上。
+
+我把仓库目前的 `doc/`、主模型、数据管线、训练脚本和最终融合脚本对了一遍。先给结论：
+
+**你现在不是单纯“模型能力到顶了”，而是实验体系里仍然存在几个足以掩盖真实上限的漏洞。尤其多模态融合这一块，我认为目前的负结论还不能采信。**
+
+仓库文档自己也承认这一点：2026-09-11 的审计已经发现 full/OOF 泄漏、gate 协议不一致、double-softmax、坏 baseline、512d 提取协议不一致、GRL 实验失效等问题，并明确说旧的“方法增益/永久证伪”需要在新协议下重验。([GitHub][1])
+
+## 我最担心的一个真实代码 bug：Gate checkpoint 保存错了
+
+这个问题比“换模型结构”优先级高很多。
+
+`train_gate_fuse.py` 在验证集变好时，只保存了 **main backbone**：
+
+```python
+if va > best:
+    best = va
+    best_sd = {
+        k: v.detach().cpu().clone()
+        for k, v in main_model.state_dict().items()
+    }
+```
+
+但最终保存 checkpoint 时：
+
+```python
+torch.save({
+    "main": best_sd,
+    "skel": skel_branch.state_dict(),
+    "gate": gate.state_dict(),
+    "proj_s": proj_s.state_dict(),
+    "head": head.state_dict()
+}, ...)
+```
+
+也就是说：
+
+**main 是 best epoch 的，skeleton / gate / projection / head 却是最后一个 epoch 的。** 
+
+而推理端又会把这五套东西一起加载，然后直接做：
+
+```python
+fv = main_model(x)
+fs = skel_branch(s)
+g = gate(torch.cat([fv, fs], -1))
+f = (1 - g) * fv + g * proj_s(fs)
+return head(f)
+```
+
+
+
+这意味着某个 checkpoint 实际上是：
+
+> **best visual encoder + final multimodal adapter**
+
+不是一个真正一致的 best multimodal checkpoint。
+
+如果你的 `+0.5pt skeleton gate` 用的正是这一训练脚本产生的权重，那么这个结果至少值得重新跑一次。更糟的是，这个 bug 很容易让“多模态融合不稳定”看起来像是方法本身的问题。
+
+### 正确做法
+
+保存一个完整 snapshot：
+
+```python
+if va > best:
+    best = va
+    best_sd = {
+        "main": copy.deepcopy(main_model.state_dict()),
+        "skel": copy.deepcopy(skel_branch.state_dict()),
+        "gate": copy.deepcopy(gate.state_dict()),
+        "proj_s": copy.deepcopy(proj_s.state_dict()),
+        "head": copy.deepcopy(head.state_dict()),
+    }
+```
+
+最后整个 `best_sd` 原样保存。
+
+而且应该同时记录：
+
+```text
+best_fused_acc
+best_main_acc
+best_skeleton_acc
+gate_mean
+gate_std
+flip_count
+```
+
+这样你才能知道究竟是 visual branch 变强了，还是 fusion head 在验证集上过拟合。
+
+---
+
+# 第二个根本问题：你现在所谓的“多模态融合”，大部分其实还是 late fusion
+
+`train_main_dual.py` 的核心是：
+
+```python
+s = self.static(x)
+m = self.motion(t)
+
+alpha = sigmoid(a)
+
+p = alpha * softmax(s) + (1-alpha) * softmax(m)
+```
+
+然后训练：
+
+```python
+CE(fused) + CE(static) + CE(motion)
+```
+
+
+
+这严格来说不是很强的 multimodal representation learning。
+
+它更接近：
+
+> 两个独立 classifier → 两个 posterior → 一个全局 scalar α
+
+所以它只能表达：
+
+$$
+p(y|x_1,x_2)
+\approx
+\alpha p_1(y|x_1)+(1-\alpha)p_2(y|x_2)
+$$
+
+但真正应该学习的是：
+
+$$
+p(y|x_1,x_2)
+$$
+
+其中第二模态应该能够改变第一模态对某个样本、某个类别的解释。
+
+例如：
+
+> main 认为 `8/10/18` 三个动作都像
+> thermal 看到人体轮廓后告诉它“更像 10”
+
+现在的 scalar α 做不到这个。
+
+它只能说：
+
+> “今天 thermal 整体占 37%，明天还是 37%。”
+
+---
+
+# 第三个问题：你目前非常可能把“互补信息”误判成“不互补”
+
+文档目前的核心叙事是：
+
+> 512d feature 跨 subject 不行 → softmax head 已经用尽信息 → multimodal feature 没什么可挖。([GitHub][1])
+
+但这条推理我不接受。
+
+因为你真正需要问的是：
+
+$$
+I(X_{thermal};Y \mid X_{main})
+$$
+
+也就是：
+
+> **thermal 在 main 已经知道以后，还能增加多少信息？**
+
+而不是：
+
+> thermal 自己能不能分类得很好？
+
+这是两个完全不同的问题。
+
+你的文档现在主要用了：
+
+* 单模态 accuracy
+* pair classifier accuracy
+* 512d LDA
+* probability averaging
+* 一些 gate
+
+这些只能说明：
+
+> thermal 是不是一个强 classifier。
+
+不能说明：
+
+> thermal 是否包含 main 没有的 residual information。
+
+事实上，一个模态只要自己 55% 准，但专门纠正主模型剩下的 20% hard samples，也可能非常有价值。
+
+---
+
+# 这也是为什么我不建议你继续堆“第三模态”
+
+你现在的实验路线有点进入：
+
+> skeleton → IMU → radar → MotionNet → pose → heatmap → gate → residual → NCM → GRL → …
+
+这种路线。
+
+文档确实记录了大量负结果。([GitHub][1])
+
+但真正值得继续的，我认为只有：
+
+**main + thermal 的 conditional residual fusion。**
+
+因为现在已经有一个重要事实：
+
+> `main + thermal` 能从约 0.67 单模态推到 LB 0.75 左右。([GitHub][1])
+
+这已经直接证明 thermal 有迁移价值。
+
+所以问题不是：
+
+> “thermal 有没有信息？”
+
+而是：
+
+> **为什么 thermal 只能通过简单概率平均产生 +8pt，而不能进一步纠正 main 的剩余错误？**
+
+这是非常值得挖的。
+
+---
+
+# 我会把融合重构成这个形式
+
+不要：
+
+$$
+p = \alpha p_m +(1-\alpha)p_t
+$$
+
+而做：
+
+$$
+z = z_m + G(z_m,z_t)\odot R(z_t)
+$$
+
+其中：
+
+* `z_m`: main 512d feature
+* `z_t`: thermal 512d feature
+* `R`: thermal → residual projector
+* `G`: conditional gate
+* 最后仍然只有一个 40-class head
+
+例如：
+
+```python
+hm = main_encoder(x_main)       # 512
+ht = thermal_encoder(x_thermal) # 512
+
+h = torch.cat([hm, ht], dim=-1)
+
+gate = torch.sigmoid(
+    gate_mlp(h)
+)
+
+residual = residual_mlp(ht)
+
+fused = hm + gate * residual
+
+logits = head(fused)
+```
+
+关键不是这个具体 MLP。
+
+真正关键是：
+
+**thermal 学的是“如何修 main”，而不是再独立学一遍 40 分类。**
+
+---
+
+# 更进一步：做 class-conditional residual
+
+你这个任务尤其适合这个。
+
+main 输出：
+
+```text
+class 8: 0.42
+class 10: 0.37
+class 18: 0.14
+```
+
+thermal 不应该简单把自己的：
+
+```text
+class 10: 0.31
+```
+
+平均进去。
+
+而应该学习：
+
+$$
+\Delta logits_{thermal}(c|main)
+$$
+
+即：
+
+```text
+main:
+8  +2.1
+10 +1.7
+18 +0.2
+
+thermal:
+10 +0.8
+18 -0.1
+```
+
+最后：
+
+```python
+logits = main_logits + gate(main_feat, thermal_feat) * thermal_residual
+```
+
+甚至可以只在 main 的 top-k 类里面修正。
+
+这个方向比你现在尝试的大量 global probability fusion 更符合这个任务。
+
+---
+
+# 第四个问题：现在的 loss 反而可能阻碍“互补”
+
+`train_main_dual.py`：
+
+```python
+loss = CE(fused) + CE(static) + CE(motion)
+```
+
+
+
+这会强迫弱模态单独承担 40-class classification。
+
+假设 skeleton 只能稳定区分动作簇，而不能直接区分 40 类。
+
+你却要求：
+
+$$
+L_{motion}=CE(motion,y)
+$$
+
+它就会努力学习一套自己并不具备足够信息的完整 classifier。
+
+这很容易出现：
+
+> 两个 branch 都学习同一套 dominant visual/class cues
+
+最后自然没有互补。
+
+更合理的是：
+
+$$
+L = CE(y,\hat y_{fusion})
++\lambda L_{main}
++\mu L_{thermal}
++\gamma L_{residual}
+$$
+
+其中：
+
+```text
+main / thermal
+    ↓
+各自 representation
+    ↓
+fusion
+    ↓
+main residual correction
+```
+
+让辅助模态主要解决：
+
+> **main 做错了什么？**
+
+而不是：
+
+> “你自己把 40 类重新分类一遍。”
+
+---
+
+# 第五个问题：main/thermal 的“最佳融合权重”本质上不应该是固定 scalar
+
+当前推理：
+
+```python
+fused += w * p
+```
+
+也就是 global weight。
+
+这对于 heterogeneous sensors 太粗糙。
+
+应该至少做到：
+
+$$
+w_i = f(
+H(p_m),
+H(p_t),
+margin_m,
+margin_t,
+topk\_agreement
+)
+$$
+
+例如：
+
+```text
+main confidence = 0.94
+thermal confidence = 0.51
+→ main 0.9
+
+main confidence = 0.47
+thermal confidence = 0.91
+→ thermal 0.75
+
+main/thermal disagree on known hard pair
+→ trigger pair-specific correction
+```
+
+这和你之前做的 skeleton gate 有相似之处，但现在应该把同样思想用在 **main ↔ thermal** 上。
+
+---
+
+# 一个非常值得注意的代码细节：你现在的 TTA 其实还没有真正改变 representation learning
+
+main inference 的 TTA 本质还是：
+
+```python
+out = model(x)
+out = out + model(flip(x))
+```
+
+
+
+thermal 也是同样结构。
+
+所以当前 0.75 体系已经相当依赖：
+
+> pretrained 3D backbone + 固定 crop + ensemble + probability averaging + flip TTA
+
+这说明你已经把“简单工程收益”基本榨干了。
+
+下一阶段应该停止做：
+
+> `flip + offset + roll + temperature + noisy-or + prior`
+
+这些在已有锚模型上不断微调。
+
+应该回到：
+
+> **representation / residual error modelling**
+
+---
+
+# 还有一个实验协议上的硬伤
+
+你的 baseline 存在明显的来源不一致：
+
+文档自己写了：
+
+> 最终 LB 锚点 `main_s42` 是单 seed、单折 full model
+> 而很多 fold 实验用的是另一套 `baseline_aug2`。([GitHub][1])
+
+这意味着：
+
+```text
+fold +2%
+```
+
+不能直接推导：
+
+```text
+LB +2%
+```
+
+尤其你又已经发现过：
+
+> fold positive → LB negative
+
+这是非常典型的 model-selection overfit。
+
+所以从现在开始，我建议把实验体系改成三层：
+
+### Level A：development fold
+
+只用于快速筛选。
+
+### Level B：locked subject
+
+完全不能碰，专门判断方法能否跨环境泛化。
+
+仓库已经开始做这个了：
+
+`locked_split.json + fair_eval.py`。([GitHub][1])
+
+### Level C：LB
+
+只有 Level B 通过以后才允许提交。
+
+这会大幅减少你现在这种：
+
+> 跑 20 个方法 → 选出一个 fold 最好的 → LB 发现没用
+
+的问题。
+
+---
+
+# 我认为现在最值得做的实验，不超过 6 个
+
+按 ROI 排序：
+
+| 优先级    | 实验                                                         | 我对收益的判断  |
+| ------ | ---------------------------------------------------------- | -------- |
+| **P0** | 修 `train_gate_fuse.py` checkpoint best-state bug，重跑 gate   | **必须做**  |
+| **P0** | main + thermal 做 conditional residual fusion               | **最值得赌** |
+| **P0** | 用 locked split 做严格 OOF                                     | **必须做**  |
+| **P1** | main / thermal intermediate feature fusion，冻结 80% backbone | **很值得**  |
+| **P1** | class-conditional hard-pair thermal correction             | **很值得**  |
+| P2     | thermal/main 多 seed + SWA                                  | 小收益，低风险  |
+| P3     | 再折腾 skeleton / IMU / radar                                 | 暂时停止     |
+
+---
+
+# 如果我是你，我甚至会换一个实验目标
+
+不要再优化：
+
+$$
+Accuracy(main+thermal)
+$$
+
+而专门优化：
+
+$$
+Accuracy(
+\text{main correct}
+\lor
+\text{thermal fixes main}
+)
+$$
+
+具体统计四个格子：
+
+|             | thermal 正确 | thermal 错误 |
+| ----------- | ---------: | ---------: |
+| **main 正确** |          A |          B |
+| **main 错误** |      **C** |          D |
+
+真正重要的是 **C**。
+
+如果：
+
+```text
+C = 15%
+```
+
+那说明 thermal 有巨大潜力。
+
+如果：
+
+```text
+C = 1%
+```
+
+才真的说明 thermal 和 main 高度冗余。
+
+我目前从仓库里看到的东西，还不足以证明 C 很小。
+
+而这是决定下一步方向的最关键统计量。
+
+---
+
+# 我对目前项目状态的判断
+
+我会把它重新定义成：
+
+> **不是性能已经卡死，而是 current late-fusion pipeline 卡死了。**
+
+你的 backbone 本身已经很强：
+
+* R2+1D-34 + IG65M
+* Depth + IR
+* thermal 独立模型
+* 100MB 约束
+* cross-subject evaluation
+
+主链能做到约 `0.75 LB`，本身已经证明数据里有很强的 signal。文档记录的当前真实提交锚点也是 `0.75124`，骨架 gate 达到 `0.75621`。([GitHub][1])
+
+但你现在的融合大部分仍然属于：
+
+```text
+独立 encoder
+    ↓
+独立 40-class classifier
+    ↓
+softmax
+    ↓
+固定/简单 gate
+    ↓
+ensemble
+```
+
+这不是“深层多模态融合”。
+
+尤其 **train_gate_fuse 的 best checkpoint 保存 bug**，让我认为目前甚至不能把“深层 skeleton gate 已经验证过”作为完全可靠的结论。
+
+所以我不会建议你继续盲目试 loss、augmentation、更多弱模态。
+
+**下一轮真正应该做的是：先修实验协议，然后把 main→thermal 重新定义成 residual correction problem。**
+
+这条路线比继续堆模态更有希望。
+
+[1]: https://github.com/Hop66/CUHK_X-Competition-Small-Model-Track/blob/main/doc/METHODOLOGY_SUMMARY.md "CUHK_X-Competition-Small-Model-Track/doc/METHODOLOGY_SUMMARY.md at main · Hop66/CUHK_X-Competition-Small-Model-Track · GitHub"
